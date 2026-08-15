@@ -60,12 +60,12 @@ the released fixed baseline and DCKD-Global-MS with matched seeds:
 JAX_PLATFORMS=gpu,cpu python main.py --gen \
   --config configs/gen/latent_ablation_a800_hpc.yaml \
   --workdir runs/baseline_seed123 \
-  --config.train.seed 123
+  --seed 123
 
 JAX_PLATFORMS=gpu,cpu python main.py --gen \
   --config configs/gen/latent_ablation_a800_v4_3_dckd_global_radius.yaml \
   --workdir runs/dckd_global_ms_seed123 \
-  --config.train.seed 123
+  --seed 123
 ```
 
 Evaluate a completed work directory with the same 50k generation stream:
