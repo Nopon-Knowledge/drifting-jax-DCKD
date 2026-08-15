@@ -54,7 +54,13 @@ def run_init():
     global _did_run_init
     if _did_run_init:
         return
-    jax.distributed.initialize()
+    try:
+        jax.distributed.initialize()
+    except ValueError as exc:
+        if "coordinator_address should be defined" not in str(exc):
+            raise
+        # Single-process GPU/CPU runs do not need JAX distributed runtime.
+        pass
     _did_run_init = True
 
 

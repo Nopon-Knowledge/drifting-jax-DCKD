@@ -33,12 +33,19 @@ def _download_artifact(
 ) -> Path:
     # Internal helper used by load_mae_jax/load_generator_jax to materialize HF artifacts locally.
     """Download artifact folder from HF and return resolved local directory."""
-    from huggingface_hub import snapshot_download
-
     local_root = Path(output_root).resolve() / "models" / kind / backend / model_id
+    if (local_root / "metadata.json").is_file() and (local_root / "ema_params.msgpack").is_file():
+        return local_root
+
     local_root.mkdir(parents=True, exist_ok=True)
     root = f"models/{kind}/{backend}/{model_id}"
     path_in_repo = f"{prefix.strip('/')}/{root}" if prefix else root
+
+    nested = local_root / path_in_repo
+    if (nested / "metadata.json").is_file() and (nested / "ema_params.msgpack").is_file():
+        return nested
+
+    from huggingface_hub import snapshot_download
 
     snapshot_download(
         repo_id=repo_id,
@@ -46,7 +53,6 @@ def _download_artifact(
         allow_patterns=[f"{path_in_repo}/*"],
         local_dir=str(local_root),
     )
-    nested = local_root / path_in_repo
     return nested if nested.exists() else local_root
 
 

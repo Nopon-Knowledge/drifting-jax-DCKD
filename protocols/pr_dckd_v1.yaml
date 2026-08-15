@@ -1,0 +1,225 @@
+protocol_id: PR-DCKD-EXP-V1
+design_frozen_at: "2026-07-28T08:47:05+08:00"
+status: design_frozen_before_new_experiment_results
+paper_target: Pattern Recognition
+project: Drifting-JAX / Density-Calibrated Kernel Drifting
+
+governance:
+  primary_hypothesis: >-
+    Under matched training seeds and the frozen independent generation stream,
+    v4.3 has lower FID than the fixed-kernel configuration selected by this
+    protocol's finite development grid.
+  primary_metric: FID
+  secondary_metrics:
+    - IS
+    - PRDC_precision
+    - PRDC_recall
+    - PRDC_density
+    - PRDC_coverage
+  checkpoint_rule: final EMA at step 30000
+  reporting:
+    - report every planned metric for every valid run
+    - report per-seed values, paired differences, mean, sample SD, median, and range
+    - training seed is the experimental unit
+    - do not claim statistical significance for n=2 or n=3
+    - do not describe generation seeds or images as independent training replicates
+  forbidden_after_results:
+    - changing a generation seed because of metric values
+    - changing a CFG or checkpoint using formal-stream results
+    - replacing the frozen fixed-kernel winner
+    - dropping a finite but unfavorable scientific result
+    - adding or removing formal training seeds after partial unblinding
+  technical_retry:
+    allowed:
+      - scheduler failure
+      - corrupt or unreadable artifact
+      - insufficient valid sample count
+      - NaN or Inf
+      - evaluator crash
+    rule: same seed, config, checkpoint, generation seed, and evaluator snapshot
+    preserve_failed_attempt: true
+
+provenance_gate:
+  required_before_reusing_historical_checkpoints: true
+  core_files:
+    - drift_loss.py
+    - train.py
+    - main.py
+    - memory_bank.py
+    - models
+    - dataset
+  assets:
+    - MAE weights
+    - VAE weights
+    - latent cache identity
+    - optimizer and EMA semantics
+    - JAX/XLA/CUDA environment
+  partial_audit_2026_07_28:
+    baseline_seed42: not_proven_retrain_for_fixed_search
+    v4_1_seed42: not_proven_not_used_in_formal_factorial
+    baseline_seeds_123_2026_3407: pending_final_asset_audit
+    v4_1_seeds_123_2026: pending_final_asset_audit
+    v4_2_seeds_123_2026: pending_final_asset_audit
+    v4_3_seeds_123_2026_3407: pending_final_asset_audit
+
+random_streams:
+  fixed_kernel_development:
+    train_seed: 42
+    generation_seeds: [104729, 130363]
+  formal:
+    train_seeds: [123, 2026, 3407]
+    generation_seed: 271828
+  qualitative:
+    generation_seed: 314159
+  fixed_eval_batch_size: 128
+  fixed_vae_decode_batch_size: 32
+  require_frozen_label_manifest: true
+
+evaluation:
+  formal_num_samples: 50000
+  development_num_samples: 10000
+  feature_extractor: frozen project Inception implementation and weights
+  one_generation_per_cell: true
+  reuse_same_samples_for_all_metrics: true
+  retain:
+    - generated Inception features
+    - logits
+    - labels
+    - sample or chunk hashes
+    - result JSON
+    - run manifest
+  prdc:
+    nearest_k: 5
+    squared_euclidean: true
+    exact_search: true
+    exclude_self_neighbor: true
+    preferred_num_samples: 50000
+    fallback:
+      num_samples: 10000
+      balanced_per_class: 10
+      must_freeze_indices_before_formal_results: true
+
+main_independent_stream:
+  baseline:
+    train_seeds: [123, 2026, 3407]
+    cfg: 3.5
+    generation_seed: 271828
+  v4_3:
+    train_seeds: [123, 2026, 3407]
+    cfg: 2.5
+    generation_seed: 271828
+
+fixed_kernel_search:
+  retrain_all_seed42_candidates: true
+  reason: >-
+    Historical Baseline seed42 predates the recoverable core-source snapshot and
+    is not provenance-equivalent to newly trained candidates.
+  candidates:
+    C0:
+      config: configs/gen/latent_ablation_a800_hpc.yaml
+      config_sha256: 3a144c49f89b39f56bd93d7aaa32ed5d338b5fe68837a4fab00a8eb36a7f1f02
+      R_list: [0.20, 0.05, 0.02]
+    C1:
+      config: configs/gen/latent_ablation_a800_pr_fixed_c1.yaml
+      config_sha256: 4c3f3a5fd77a6da78fd533adbb9f34fb448a0b0f1a4a24ec52d1ccc608b2c1d1
+      R_list: [0.40, 0.20, 0.10]
+    C2:
+      config: configs/gen/latent_ablation_a800_pr_fixed_c2.yaml
+      config_sha256: 89ffc6e4b9adf37d4023d262094ed637325fd457d98330b2c6174c3f465531a4
+      R_list: [0.50, 0.30, 0.15]
+    C3:
+      config: configs/gen/latent_ablation_a800_pr_fixed_c3.yaml
+      config_sha256: 98abee1c051a46cfcc9a072186b5d791842999590c903278b0254dabad8463cc
+      R_list: [0.50, 0.388, 0.194]
+  train_seed: 42
+  train_steps: 30000
+  cfg_grid: [1.5, 2.0, 2.5, 3.0, 3.5]
+  generation_seeds: [104729, 130363]
+  selection_order:
+    - lowest mean FID across both development streams
+    - lowest worst-stream FID
+    - highest mean IS
+    - lowest candidate ID
+    - lowest CFG
+  boundary_rule: do not expand this grid after seeing results
+  selected_formal_training_seeds: [123, 2026, 3407]
+  formal_generation_seed: 271828
+
+factorial_2x2:
+  common_cfg: 2.5
+  formal_generation_seed: 271828
+  train_seeds: [123, 2026, 3407]
+  cells:
+    local_single:
+      name: v4.2
+      config: configs/gen/latent_ablation_a800_v4_2_dckd_single_scale.yaml
+      config_sha256: e26162c364c786781e6389496282a65b5a6142feb83ca4de06bc5eb32b7aa788
+    local_multi:
+      name: v4.1
+      config: configs/gen/latent_ablation_a800_v4_1_dckd.yaml
+      config_sha256: ccdaf16e7cabfb417253bf456fb120f1b1f77cffa4a3a33dccec13fe17ae0878
+    global_single:
+      name: DCKD-Global-Single
+      config: configs/gen/latent_ablation_a800_pr_dckd_global_single.yaml
+      config_sha256: 19a0473ecbb7c9e3b03e2af3d6c10c14ab596fbbec784548d04ba355d9376ce1
+    global_multi:
+      name: v4.3
+      config: configs/gen/latent_ablation_a800_v4_3_dckd_global_radius.yaml
+      config_sha256: a5d322d7b7f29ec8f5b924d64d90fdbfcfe91438c5b198765710c522a3e1728f
+
+v5_1_policy:
+  retain_in_main_paper: true
+  v5_1:
+    train_seeds: [42, 123, 2026]
+    cfg: 2.0
+    generation_seed: 271828
+  paired_v4_3:
+    train_seeds: [42, 123, 2026]
+    cfg: 2.5
+    generation_seed: 271828
+  note: seed42 remains a development seed and is not a held-out training replication
+
+efficiency:
+  full_training_seed: 123
+  full_training_repeats_per_method: 1
+  methods: [baseline, v4_3]
+  identical_data_and_label_order: true
+  mechanism_diagnostics_disabled: true
+  short_benchmark:
+    order_cycles: [AB, BA, AB]
+    warmup_steps: 50
+    timed_blocks: 5
+    steps_per_block: 200
+    latency_repeats: 200
+    throughput_repeats: 50
+  runtime_equivalence_interval_percent: [-5, 5]
+
+mechanism:
+  method: v4_3
+  train_seed: 42
+  exploratory_not_in_primary_metric_mean: true
+  required_diagnostics:
+    - kNN distance distribution
+    - unclipped and clipped radius distribution
+    - lower and upper clamp hit rates
+    - training-stage change
+
+resource_constrained:
+  enabled: true
+  train_seeds: [123, 2026]
+  train_steps: 30000
+  train_batch_size: 4
+  positive_bank_size: 32
+  negative_bank_size: 256
+  interpretation: combined smaller batch/banks and lower total sample budget
+  baseline_cfg: 3.5
+  v4_3_cfg: 2.5
+  formal_generation_seed: 271828
+
+implementation_snapshot:
+  status: pending_phase0_code_and_environment_validation
+  companion_manifest: protocols/pr_dckd_v1_implementation.json
+  rule: >-
+    Create the companion implementation manifest after Phase 0 tests without
+    modifying this frozen design file. Formal evaluation and formal confirmation
+    training cannot start until the companion manifest is finalized.

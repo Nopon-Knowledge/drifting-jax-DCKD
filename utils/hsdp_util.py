@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import mesh_utils
 from flax import linen as nn
@@ -8,16 +11,29 @@ from typing import Dict, Any, Sequence, Tuple
 global_mesh = None
 axis_to_dim = dict()
 
-def set_global_mesh(hsdp_dim: int = 8):
+def _mesh_axis_size(requested: int, total_devices: int) -> int:
+    axis_size = min(max(1, int(requested)), total_devices)
+    while total_devices % axis_size != 0:
+        axis_size -= 1
+    return axis_size
+
+def set_global_mesh(hsdp_dim: int = 8, devices: Sequence[jax.Device] | None = None):
     global global_mesh
     global axis_to_dim
-    hsdp_dim = min(hsdp_dim, jax.process_count() * jax.local_device_count())
-    mesh_shape = (jax.process_count() * jax.local_device_count() // hsdp_dim, hsdp_dim)
+    selected_devices = list(devices) if devices is not None else None
+    total_devices = len(selected_devices) if selected_devices is not None else jax.process_count() * jax.local_device_count()
+    if total_devices <= 0:
+        raise RuntimeError("No JAX devices available for global mesh.")
+    hsdp_dim = _mesh_axis_size(hsdp_dim, total_devices)
+    mesh_shape = (total_devices // hsdp_dim, hsdp_dim)
     axis_names = ['data', 'fsdp']
     axis_to_dim['fsdp'] = hsdp_dim
-    axis_to_dim['data'] = jax.process_count() * jax.local_device_count() // hsdp_dim
-    devices = mesh_utils.create_device_mesh(mesh_shape, allow_split_physical_axes=True)
-    global_mesh = Mesh(devices, axis_names=axis_names)
+    axis_to_dim['data'] = total_devices // hsdp_dim
+    if selected_devices is None:
+        mesh_devices = mesh_utils.create_device_mesh(mesh_shape, allow_split_physical_axes=True)
+    else:
+        mesh_devices = np.asarray(selected_devices, dtype=object).reshape(mesh_shape)
+    global_mesh = Mesh(mesh_devices, axis_names=axis_names)
 
 def get_global_mesh():
     global global_mesh

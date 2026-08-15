@@ -10,7 +10,7 @@ import pickle
 def download(url, target_md5):
     # name = url[url.rfind('/') + 1 : url.rfind('?')]
     # cache file dir
-    cache_path = '/tmp/inception_params.pkl'
+    cache_path = os.environ.get('INCEPTION_PARAMS_PATH', '/tmp/inception_params.pkl')
     if os.path.exists(cache_path):
         return pickle.load(open(cache_path, 'rb'))
     
@@ -48,4 +48,3 @@ def get(dictionary, key):
     if dictionary is None or key not in dictionary:
         return None
     return dictionary[key]
-

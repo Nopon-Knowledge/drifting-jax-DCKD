@@ -1,0 +1,3 @@
+method,train_seed,train_steps,gpu_hours,steps_per_second,training_samples_per_second,profile_peak_memory_gb
+Released fixed kernel,123,30000,5.563333,1.497903,11.983223,40.595
+DCKD-Global-MS,123,30000,7.851111,1.061421,8.491367,40.627

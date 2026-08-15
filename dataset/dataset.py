@@ -25,8 +25,13 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
-from dataset.latent import LatentDataset
-from dataset.vae import vae_enc_decode
+from dataset.latent import (
+    ImageNetFlatValFolder,
+    LatentDataset,
+    _imagenet_val_annotation_root,
+    _is_imagefolder_split,
+    _resolve_imagenet_data_root,
+)
 from utils.env import IMAGENET_PATH, IMAGENET_CACHE_PATH
 from utils.logging import log_for_0
 
@@ -81,7 +86,19 @@ def _build_imagenet_dataset(*, resolution: int, use_aug: bool, use_cache: bool, 
         return LatentDataset(root=os.path.join(IMAGENET_CACHE_PATH, split))
 
     transform = _build_transforms(resolution, use_aug=use_aug, split=split)
-    return ImageFolder(root=os.path.join(IMAGENET_PATH, split), transform=transform)
+    data_root = _resolve_imagenet_data_root(IMAGENET_PATH)
+    split_root = data_root / split
+    if split == "val" and not _is_imagefolder_split(split_root):
+        train_root = data_root / "train"
+        classes = sorted(child.name for child in train_root.iterdir() if child.is_dir())
+        return ImageNetFlatValFolder(
+            root=split_root,
+            annotation_root=_imagenet_val_annotation_root(data_root),
+            classes=classes,
+            transform=transform,
+            return_rel_path=False,
+        )
+    return ImageFolder(root=str(split_root), transform=transform)
 
 
 def worker_init_fn(worker_id: int, rank: int) -> None:
@@ -152,19 +169,29 @@ def create_imagenet_split(
         persistent_workers=True if num_workers > 0 else False,
     )
 
-    if use_latent or use_cache:
+    if use_cache:
+        def preprocess_fn(batch, rng=jax.random.PRNGKey(0)):
+            del rng
+            cached_latent, label = batch
+            # cached_latent: BHWC latent, label: B
+            return {"images": cached_latent, "labels": label}
+
+        def postprocess_fn(images):
+            from dataset.vae import vae_enc_decode
+
+            _, decode_fn = vae_enc_decode()
+            return jnp.clip((decode_fn(images) + 1) / 2, 0, 1)
+
+        return loader, preprocess_fn, postprocess_fn
+
+    if use_latent:
+        from dataset.vae import vae_enc_decode
+
         encode_fn, decode_fn = vae_enc_decode()
-        if use_cache:
-            def preprocess_fn(batch, rng=jax.random.PRNGKey(0)):
-                del rng
-                cached_latent, label = batch
-                # cached_latent: BHWC latent, label: B
-                return {"images": cached_latent, "labels": label}
-        else:
-            def preprocess_fn(batch, rng=jax.random.PRNGKey(0)):
-                image, label = batch
-                # image: BCHW -> VAE encode -> BHWC latent
-                return {"images": encode_fn(image, rng), "labels": label}
+        def preprocess_fn(batch, rng=jax.random.PRNGKey(0)):
+            image, label = batch
+            # image: BCHW -> VAE encode -> BHWC latent
+            return {"images": encode_fn(image, rng), "labels": label}
 
         def postprocess_fn(images):
             # images: BHWC latent -> decode -> BCHW pixel in [0,1]
@@ -188,9 +215,10 @@ def create_imagenet_split(
 def get_postprocess_fn(*, use_aug: bool = False, use_latent: bool = False, use_cache: bool = False, has_clip: bool = True):
     """Return postprocess function for generated samples by dataset mode flags."""
     if use_latent or use_cache:
-        _, decode_fn = vae_enc_decode()
-
         def postprocess(images):
+            from dataset.vae import vae_enc_decode
+
+            _, decode_fn = vae_enc_decode()
             out = (decode_fn(images) + 1) / 2
             return jnp.clip(out, 0, 1) if has_clip else out
 

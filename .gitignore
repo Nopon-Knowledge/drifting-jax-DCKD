@@ -1,5 +1,53 @@
+# Runtime outputs
 runs/
 data/
+datasets/
+logs/
+tmp/
 wandb/
+checkpoints/
+
+# Python and tooling
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Datasets, caches, model artifacts, and offline dependency bundles
+fid-assets/
+hf-cache*/
+wheelhouse*/
+*.ckpt
+*.msgpack
+*.npz
+*.pt
+*.pth
+*.safetensors
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Private research workspace material. Aggregated public results live in results/.
+CODEX_HANDOFF.md
+paper/
+reports/
+elsarticle/
+*.docx

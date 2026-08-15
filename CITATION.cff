@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, cite both this DCKD release and the original
+  Generative Modeling via Drifting paper.
+title: Density-Calibrated Kernel Drifting for One-Step Image Generation
+type: software
+version: 1.0.0
+date-released: 2026-08-15
+url: https://github.com/Nopon-Knowledge/drifting-jax
+repository-code: https://github.com/Nopon-Knowledge/drifting-jax
+authors:
+  - family-names: Wang
+    given-names: Zixin
+  - family-names: Liu
+    given-names: Jingchao
+    email: 20100058@xijing.edu.cn
+  - family-names: Zhao
+    given-names: Zizheng
+  - family-names: Dong
+    given-names: Xiaoyu
+references:
+  - type: article
+    title: Generative Modeling via Drifting
+    authors:
+      - family-names: Deng
+        given-names: Mingyang
+      - family-names: Li
+        given-names: He
+      - family-names: Li
+        given-names: Tianhong
+      - family-names: Du
+        given-names: Yilun
+      - family-names: He
+        given-names: Kaiming
+    year: 2026
+    url: https://arxiv.org/abs/2602.04770

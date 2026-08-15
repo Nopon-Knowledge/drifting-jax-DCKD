@@ -9,6 +9,7 @@ from typing import Any, Optional
 import jax
 import jax.numpy as jnp
 import jax.experimental.multihost_utils as mu
+import numpy as np
 import optax
 from flax.training import train_state
 from tqdm import tqdm
@@ -16,7 +17,7 @@ from einops import repeat, rearrange
 
 from dataset.dataset import infinite_sampler, get_postprocess_fn
 from drift_loss import drift_loss
-from memory_bank import ArrayMemoryBank
+from memory_bank import ArrayMemoryBank, RecencyGeneratedNegativeBank
 from models.mae_model import build_activation_function
 from utils.ckpt_util import save_checkpoint, restore_checkpoint, save_params_ema_artifact
 from utils.env import HF_ROOT
@@ -44,7 +45,103 @@ def _generator_model_config(model) -> dict:
     }
 
 
-def train_step(state: TrainState, labels, samples, negative_samples, feature_params, feature_apply, rng_init: jax.random.PRNGKey, learning_rate_fn: Any = None, cfg_min=1.0, cfg_max=4.0, neg_cfg_pw=1.0, no_cfg_frac=0.0, gen_per_label=8, activation_kwargs=dict(), loss_kwargs=dict(R_list=[0.02, 0.05, 0.2]), max_grad_norm=2.0):
+def _linear_ramp(step, warmup_steps: int = 0, ramp_steps: int = 1):
+    step_f = jnp.asarray(step + 1, dtype=jnp.float32)
+    warmup_f = jnp.asarray(float(warmup_steps), dtype=jnp.float32)
+    ramp_f = jnp.asarray(max(1, int(ramp_steps)), dtype=jnp.float32)
+    return jnp.clip((step_f - warmup_f) / ramp_f, 0.0, 1.0)
+
+
+def _pairwise_distance(x, y, eps=1e-8):
+    xydot = jnp.einsum("bnd,bmd->bnm", x, y)
+    xnorms = jnp.einsum("bnd,bnd->bn", x, x)
+    ynorms = jnp.einsum("bmd,bmd->bm", y, y)
+    sq_dist = xnorms[:, :, None] + ynorms[:, None, :] - 2 * xydot
+    return jnp.sqrt(jnp.clip(sq_dist, a_min=eps))
+
+
+def _positive_coupling_weight(feature_pos, feature_gen, step, alpha=0.0, tau=0.5, warmup_steps=0, ramp_steps=1):
+    """Soft-OT positive reweighting that favors real samples near current generated samples."""
+    base_weight = jnp.ones_like(feature_pos[:, :, 0])
+    alpha_eff = float(alpha) * _linear_ramp(step, warmup_steps, ramp_steps)
+    distances = _pairwise_distance(
+        jax.lax.stop_gradient(feature_gen.astype(jnp.float32)),
+        jax.lax.stop_gradient(feature_pos.astype(jnp.float32)),
+    )
+    scores = -distances.mean(axis=1) / max(float(tau), 1e-6)
+    soft_weight = jax.nn.softmax(scores, axis=-1) * feature_pos.shape[1]
+    weight = (1.0 - alpha_eff) * base_weight + alpha_eff * soft_weight
+    probs = weight / jnp.clip(weight.sum(axis=-1, keepdims=True), a_min=1e-6)
+    entropy = -jnp.sum(probs * jnp.log(jnp.clip(probs, a_min=1e-6)), axis=-1)
+    entropy = entropy / jnp.log(jnp.asarray(feature_pos.shape[1], dtype=jnp.float32))
+    return weight, {
+        "pos_coupling_alpha": alpha_eff,
+        "pos_coupling_entropy": entropy.mean(),
+        "pos_coupling_weight_std": weight.std(),
+        "pos_coupling_distance": distances.mean(),
+    }
+
+
+def _radial_log_power(samples, radial_bins: int = 16, eps: float = 1e-6, normalize_total_power: bool = True):
+    samples = samples.astype(jnp.float32)
+    samples = samples - samples.mean(axis=(1, 2), keepdims=True)
+    fft = jnp.fft.fft2(samples, axes=(1, 2))
+    power = (jnp.real(fft) ** 2 + jnp.imag(fft) ** 2).mean(axis=-1)
+
+    h, w = samples.shape[1], samples.shape[2]
+    fy = jnp.fft.fftfreq(h)
+    fx = jnp.fft.fftfreq(w)
+    yy, xx = jnp.meshgrid(fy, fx, indexing="ij")
+    radius = jnp.sqrt(yy ** 2 + xx ** 2)
+    radius = radius / jnp.clip(radius.max(), a_min=eps)
+    bin_idx = jnp.clip((radius * radial_bins).astype(jnp.int32), 0, radial_bins - 1)
+    bin_one_hot = jax.nn.one_hot(bin_idx.reshape(-1), radial_bins, dtype=jnp.float32)
+
+    power_flat = power.reshape((power.shape[0], -1))
+    radial_power = power_flat @ bin_one_hot
+    bin_count = jnp.clip(bin_one_hot.sum(axis=0), a_min=1.0)
+    radial_power = radial_power / bin_count[None, :]
+    if normalize_total_power:
+        radial_power = radial_power / jnp.clip(radial_power.mean(axis=-1, keepdims=True), a_min=eps)
+    return jnp.log(jnp.clip(radial_power, a_min=eps))
+
+
+def _spectral_prior_loss(
+    gen_samples,
+    positive_samples,
+    gen_per_label: int,
+    radial_bins: int = 16,
+    loss_type: str = "l2",
+    normalize_total_power: bool = True,
+):
+    gen_power = _radial_log_power(
+        gen_samples,
+        radial_bins=radial_bins,
+        normalize_total_power=normalize_total_power,
+    )
+    gen_power = rearrange(gen_power, "(b g) k -> b g k", g=gen_per_label).mean(axis=1)
+
+    pos_flat = rearrange(positive_samples, "b p h w c -> (b p) h w c")
+    pos_power = _radial_log_power(
+        pos_flat,
+        radial_bins=radial_bins,
+        normalize_total_power=normalize_total_power,
+    )
+    pos_power = rearrange(pos_power, "(b p) k -> b p k", p=positive_samples.shape[1]).mean(axis=1)
+    pos_power = jax.lax.stop_gradient(pos_power)
+
+    diff = gen_power - pos_power
+    if loss_type == "l1":
+        loss = jnp.abs(diff).mean()
+    else:
+        loss = (diff ** 2).mean()
+    return loss, {
+        "spectral_prior_loss": loss,
+        "spectral_prior_diff": jnp.abs(diff).mean(),
+    }
+
+
+def train_step(state: TrainState, labels, samples, negative_samples, negative_weights, feature_params, feature_apply, rng_init: jax.random.PRNGKey, learning_rate_fn: Any = None, cfg_min=1.0, cfg_max=4.0, neg_cfg_pw=1.0, no_cfg_frac=0.0, gen_per_label=8, activation_kwargs=dict(), loss_kwargs=dict(R_list=[0.02, 0.05, 0.2]), positive_coupling=dict(), spectral_prior=dict(), max_grad_norm=2.0):
     """Run one generator optimization step.
 
     Args:
@@ -52,6 +149,7 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
         labels: class labels with shape `(B,)`.
         samples: positive memory-bank samples with shape `(B, P, H, W, C)`.
         negative_samples: negative memory-bank samples with shape `(B, N, H, W, C)`.
+        negative_weights: negative weights with shape `(B, N)`.
         feature_params: feature-model variable tree consumed by `feature_apply`.
         feature_apply: callable returning activation dict for input batch of shape `(B', H, W, C)`.
         rng_init: base PRNGKey for this train loop.
@@ -63,8 +161,26 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
         gen_per_label: number of generator samples drawn per label, output shape `(B * gen_per_label, H, W, C)`.
         activation_kwargs: keyword args forwarded to feature activation extraction.
         loss_kwargs: keyword args forwarded to `drift_loss`.
+        positive_coupling: soft-OT positive reweighting settings.
+        spectral_prior: latent/image radial-spectrum prior settings.
         max_grad_norm: gradient clipping norm.
     """
+    positive_coupling = positive_coupling or {}
+    pos_coupling_enabled = bool(positive_coupling.get("enabled", False))
+    pos_coupling_alpha = float(positive_coupling.get("alpha", 0.0))
+    pos_coupling_tau = float(positive_coupling.get("tau", 0.5))
+    pos_coupling_warmup = int(positive_coupling.get("warmup_steps", 0))
+    pos_coupling_ramp = int(positive_coupling.get("ramp_steps", 1))
+
+    spectral_prior = spectral_prior or {}
+    spectral_prior_enabled = bool(spectral_prior.get("enabled", False))
+    spectral_lambda = float(spectral_prior.get("lambda_spec", 0.0))
+    spectral_warmup = int(spectral_prior.get("warmup_steps", 0))
+    spectral_ramp = int(spectral_prior.get("ramp_steps", 1))
+    spectral_bins = int(spectral_prior.get("radial_bins", 16))
+    spectral_loss_type = str(spectral_prior.get("loss_type", "l2")).lower()
+    spectral_normalize = bool(spectral_prior.get("normalize_total_power", True))
+
     rng_step = jax.random.fold_in(rng_init, state.step)
 
 
@@ -81,10 +197,11 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
     frac2 = jax.random.uniform(cfg_seed2, (samples.shape[0],))
     cfg = jnp.where(frac2 < no_cfg_frac, 1.0, cfg)
 
-    def loss_grad_info(labels, samples, negative_samples, cfg, rng_step):
+    def loss_grad_info(labels, samples, negative_samples, negative_weights, cfg, rng_step):
         labels = enforce_ddp(labels)
         samples = enforce_ddp(samples)
         negative_samples = enforce_ddp(negative_samples)
+        negative_weights = enforce_ddp(negative_weights)
         cfg = enforce_ddp(cfg)
         bsz = labels.shape[0]
         
@@ -122,15 +239,33 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
                 feature_gen = enforce_ddp(rearrange(feature_gen, 'b x f d -> (b f) x d'))
                 feature_uncond = enforce_ddp(rearrange(feature_uncond, 'b x f d -> (b f) x d'))
                 B = feature_gen.shape[0]
+                weighted_uncond = repeat(
+                    uncond_w[:, None] * negative_weights,
+                    'b k -> (b f) k',
+                    f=B // uncond_w.shape[0],
+                )
+                weight_pos = jnp.ones_like(feature_pos[:, :, 0])
+                coupling_info = {}
+                if pos_coupling_enabled and pos_coupling_alpha > 0.0:
+                    weight_pos, coupling_info = _positive_coupling_weight(
+                        feature_pos=feature_pos,
+                        feature_gen=feature_gen,
+                        step=state.step,
+                        alpha=pos_coupling_alpha,
+                        tau=pos_coupling_tau,
+                        warmup_steps=pos_coupling_warmup,
+                        ramp_steps=pos_coupling_ramp,
+                    )
                 loss, info = drift_loss(
                     gen=feature_gen,
                     fixed_pos=feature_pos,
                     fixed_neg=feature_uncond,
                     weight_gen=jnp.ones_like(feature_gen[:, :, 0]),
-                    weight_pos=jnp.ones_like(feature_pos[:, :, 0]),
-                    weight_neg=repeat(uncond_w, 'b -> (b f) k', f=B // uncond_w.shape[0], k=n_uncond),
+                    weight_pos=weight_pos,
+                    weight_neg=weighted_uncond,
                     **loss_kwargs,
                 )
+                info.update(coupling_info)
                 return loss, info
             
             loss_per_feature = jax.tree.map(feature_loss, sg_features, gen_features)
@@ -142,6 +277,23 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
                     total_info[f'{k2}/{k}'] = v2
             total_loss = total_loss.mean()
             total_info = jax.tree.map(lambda x: x.mean(), total_info)
+            if spectral_prior_enabled and spectral_lambda > 0.0:
+                spectral_loss, spectral_info = _spectral_prior_loss(
+                    gen_samples=gen_samples,
+                    positive_samples=samples,
+                    gen_per_label=n_gen,
+                    radial_bins=spectral_bins,
+                    loss_type=spectral_loss_type,
+                    normalize_total_power=spectral_normalize,
+                )
+                spectral_lambda_eff = spectral_lambda * _linear_ramp(
+                    state.step,
+                    warmup_steps=spectral_warmup,
+                    ramp_steps=spectral_ramp,
+                )
+                total_loss = total_loss + spectral_lambda_eff * spectral_loss
+                total_info.update(spectral_info)
+                total_info["spectral_prior_lambda"] = spectral_lambda_eff
 
             return total_loss, total_info
 
@@ -149,7 +301,7 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
         (loss, metric), grads = grad_fn(state.params)
         return loss, metric, grads
 
-    loss, metric, grads = loss_grad_info(labels, samples, negative_samples, cfg, rng_step)
+    loss, metric, grads = loss_grad_info(labels, samples, negative_samples, negative_weights, cfg, rng_step)
 
     g_norm = optax.global_norm(grads)
     clipper = optax.clip_by_global_norm(max_grad_norm)
@@ -198,6 +350,46 @@ def generate_step(batch, params, rng, apply_fn, postprocess_fn, cfg_scale=1.0):
         latent_samples
     )
     return postprocess_fn(latent_samples)
+
+
+def _select_summary_leaf(features, summary_key: str = ""):
+    """Pick one activation leaf for compact replay-bank distance summaries."""
+    if summary_key and summary_key in features:
+        return features[summary_key]
+    for key in ("layer4_mean", "layer4", "layer3_mean", "layer3", "norm_x"):
+        if key in features:
+            return features[key]
+    first_key = sorted(features.keys())[0]
+    return features[first_key]
+
+
+def _summarize_features(features, summary_key: str = ""):
+    leaf = _select_summary_leaf(features, summary_key).astype(jnp.float32)
+    if leaf.ndim > 2:
+        leaf = leaf.mean(axis=tuple(range(1, leaf.ndim - 1)))
+    leaf = leaf.reshape((leaf.shape[0], -1))
+    norm = jnp.linalg.norm(leaf, axis=1, keepdims=True)
+    return leaf / jnp.clip(norm, a_min=1e-6)
+
+
+def feature_summary_step(samples, feature_params, feature_apply, activation_kwargs=dict(), summary_key: str = ""):
+    features = feature_apply(feature_params, samples, **activation_kwargs)
+    return _summarize_features(features, summary_key)
+
+
+def generate_replay_step(labels, params, rng, apply_fn, cfg_scale=1.0):
+    labels = jax.lax.with_sharding_constraint(labels, data_shard())
+    samples = apply_fn(
+        {'params': params},
+        train=False,
+        rngs=prepare_rng(rng, ['noise']),
+        c=labels,
+        cfg_scale=cfg_scale,
+    )['samples']
+    return jax.tree_util.tree_map(
+        lambda x: jax.lax.with_sharding_constraint(x, ddp_shard()),
+        samples,
+    )
 def train_gen(
     model,  # DitGen model instance
     optimizer,  # Optax optimizer transform
@@ -243,11 +435,15 @@ def train_gen(
     init_from="",  # `hf://<name>` or local dir of model
     push_per_step=0,  # memory-bank fill factor per train step
     push_at_resume=3000,  # extra fill multiplier when resuming
+    generated_replay=dict(),  # recency-aware generated negative replay settings
+    positive_coupling=dict(),  # soft-OT positive reweighting settings
+    spectral_prior=dict(),  # latent/image radial-spectrum prior settings
     workdir="runs",  # run root containing checkpoints/logs
 ):
     """
     Main training loop.
     """
+    eval_enabled = int(eval_per_step) > 0 and int(eval_samples) > 0
     if isinstance(ema_decay, (list, tuple)):
         if len(ema_decay) != 1:
             raise ValueError(f"Expected a single ema_decay value, got {ema_decay}")
@@ -260,6 +456,26 @@ def train_gen(
         cfg_list = [float(cfg) for cfg in cfg_list]
     else:
         cfg_list = [float(cfg_list)]
+
+    generated_replay = generated_replay or {}
+    replay_enabled = bool(generated_replay.get("enabled", False))
+    replay_neg_per_sample = int(generated_replay.get("neg_per_sample", 0))
+    if replay_enabled and replay_neg_per_sample <= 0:
+        raise ValueError("train.generated_replay.neg_per_sample must be > 0 when generated replay is enabled.")
+    replay_bank_size = int(generated_replay.get("bank_size", 256))
+    replay_warmup_steps = int(generated_replay.get("warmup_steps", 100))
+    replay_push_interval = int(generated_replay.get("push_interval", 1))
+    replay_push_per_label = int(generated_replay.get("push_per_label", 1))
+    replay_cfg_scale = float(generated_replay.get("cfg_scale", 1.0))
+    replay_half_life = float(generated_replay.get("half_life", 500.0))
+    replay_distance_scale = float(generated_replay.get("distance_scale", 1.0))
+    replay_hard_fraction = float(generated_replay.get("hard_fraction", 0.5))
+    replay_hard_fraction_min = float(generated_replay.get("hard_fraction_min", 0.1))
+    replay_candidate_multiplier = int(generated_replay.get("candidate_multiplier", 4))
+    replay_min_weight = float(generated_replay.get("min_weight", 0.05))
+    replay_max_weight = float(generated_replay.get("max_weight", 4.0))
+    replay_weight_scale = float(generated_replay.get("weight_scale", 0.5))
+    replay_summary_key = str(generated_replay.get("summary_key", "layer4_mean"))
 
     rng = jax.random.PRNGKey(seed)
     rng, init_rng = jax.random.split(rng)
@@ -277,8 +493,42 @@ def train_gen(
     gen_step_jit = jax.jit(partial(generate_step, apply_fn=state.apply_fn, postprocess_fn=postprocess_fn))
     assert feature_params is not None, "feature_params must be provided for multi-host safe feature extraction"
     loss_kwargs['R_list'] = tuple(loss_kwargs['R_list'])
+    if "adaptive_multipliers" in loss_kwargs:
+        loss_kwargs["adaptive_multipliers"] = tuple(loss_kwargs["adaptive_multipliers"])
     state_sharding = jax.tree.map(lambda x: x.sharding, state)
-    train_step_jit = jax.jit(partial(train_step, rng_init=rng_train, learning_rate_fn=learning_rate_fn, feature_apply=activation_fn, activation_kwargs=activation_kwargs, loss_kwargs=loss_kwargs, **forward_dict, max_grad_norm=max_grad_norm), out_shardings=(state_sharding, None))
+    train_step_jit = jax.jit(
+        partial(
+            train_step,
+            rng_init=rng_train,
+            learning_rate_fn=learning_rate_fn,
+            feature_apply=activation_fn,
+            activation_kwargs=activation_kwargs,
+            loss_kwargs=loss_kwargs,
+            positive_coupling=positive_coupling,
+            spectral_prior=spectral_prior,
+            **forward_dict,
+            max_grad_norm=max_grad_norm,
+        ),
+        out_shardings=(state_sharding, None),
+    )
+    replay_feature_summary_jit = None
+    replay_generate_jit = None
+    if replay_enabled:
+        replay_feature_summary_jit = jax.jit(
+            partial(
+                feature_summary_step,
+                feature_apply=activation_fn,
+                activation_kwargs=activation_kwargs,
+                summary_key=replay_summary_key,
+            )
+        )
+        replay_generate_jit = jax.jit(
+            partial(
+                generate_replay_step,
+                apply_fn=state.apply_fn,
+                cfg_scale=replay_cfg_scale,
+            )
+        )
 
     ema_to_params_func = map_to_sharding(state.params)
     
@@ -288,6 +538,20 @@ def train_gen(
     pbar = tqdm(range(step, total_steps), initial=step, total=total_steps) if is_rank_zero() else range(step, total_steps)
     memory_bank_positive = ArrayMemoryBank(num_classes=1000, max_size=positive_bank_size)
     memory_bank_negative = ArrayMemoryBank(num_classes=1, max_size=negative_bank_size)
+    replay_rng = np.random.default_rng(int(seed) + 7919 + jax.process_index())
+    generated_negative_bank = None
+    if replay_enabled:
+        generated_negative_bank = RecencyGeneratedNegativeBank(
+            num_classes=1000,
+            max_size=replay_bank_size,
+            half_life=replay_half_life,
+            distance_scale=replay_distance_scale,
+            hard_fraction=replay_hard_fraction,
+            hard_fraction_min=replay_hard_fraction_min,
+            candidate_multiplier=replay_candidate_multiplier,
+            min_weight=replay_min_weight,
+            max_weight=replay_max_weight,
+        )
     mu.sync_global_devices("train loop started")
     train_iter = infinite_sampler(train_loader, step)
 
@@ -323,28 +587,120 @@ def train_gen(
         labels = labels[select_indices]
         images = images[select_indices]
 
-        positive_samples = memory_bank_positive.sample(labels, n_samples=pos_per_sample)
-        negative_samples = memory_bank_negative.sample(labels * 0, n_samples=neg_per_sample)
+        labels_host = np.asarray(jax.device_get(labels), dtype=np.int32)
+        positive_samples = memory_bank_positive.sample(labels_host, n_samples=pos_per_sample, rng=replay_rng)
+        real_negative_samples = memory_bank_negative.sample(
+            np.zeros_like(labels_host),
+            n_samples=neg_per_sample,
+            rng=replay_rng,
+        )
+        real_negative_weights = jnp.ones(
+            (real_negative_samples.shape[0], real_negative_samples.shape[1]),
+            dtype=jnp.float32,
+        )
+        negative_samples = real_negative_samples
+        negative_weights = real_negative_weights
+        replay_metrics = {}
+        if replay_enabled:
+            replay_result = None
+            if generated_negative_bank is not None and generated_negative_bank.total_count > 0:
+                query_summaries = replay_feature_summary_jit(images, feature_params)
+                replay_result = generated_negative_bank.sample(
+                    labels_host,
+                    n_samples=replay_neg_per_sample,
+                    current_step=step,
+                    query_summaries=np.asarray(jax.device_get(query_summaries)),
+                    rng=replay_rng,
+                    return_info=True,
+                )
+            if replay_result is None:
+                replay_negative_samples = jnp.zeros(
+                    (
+                        real_negative_samples.shape[0],
+                        replay_neg_per_sample,
+                        *real_negative_samples.shape[2:],
+                    ),
+                    dtype=real_negative_samples.dtype,
+                )
+                replay_negative_weights = jnp.zeros(
+                    (real_negative_samples.shape[0], replay_neg_per_sample),
+                    dtype=jnp.float32,
+                )
+                replay_metrics = {
+                    "replay/total_count": 0.0,
+                    "replay/nonzero_frac": 0.0,
+                    "replay/weight_mean": 0.0,
+                    "replay/age_mean": 0.0,
+                    "replay/distance_mean": 0.0,
+                    "replay/hard_fraction_mean": 0.0,
+                }
+            else:
+                replay_negative_samples, replay_negative_weights, replay_metrics = replay_result
+                replay_negative_weights = replay_negative_weights * replay_weight_scale
+            negative_samples = jnp.concatenate([real_negative_samples, replay_negative_samples], axis=1)
+            negative_weights = jnp.concatenate([real_negative_weights, replay_negative_weights], axis=1)
 
-        merged_positive, merged_negative, merged_labels = merge_data((positive_samples, negative_samples, labels))
+        merged_positive, merged_negative, merged_negative_weights, merged_labels = merge_data(
+            (positive_samples, negative_samples, negative_weights, labels)
+        )
 
         process_time = time.time() - start_time
 
         profile_metrics = dict()
         if (step == initial_step):
-            profile_metrics = profile_func(train_step_jit, (state, merged_labels, merged_positive, merged_negative, feature_params), name="train_step")
+            profile_metrics = profile_func(
+                train_step_jit,
+                (state, merged_labels, merged_positive, merged_negative, merged_negative_weights, feature_params),
+                name="train_step",
+            )
 
-        new_state, metrics = train_step_jit(state, merged_labels, merged_positive, merged_negative, feature_params)
+        new_state, metrics = train_step_jit(
+            state,
+            merged_labels,
+            merged_positive,
+            merged_negative,
+            merged_negative_weights,
+            feature_params,
+        )
         metrics = jax.tree.map(lambda x: x.mean(), metrics)
+        state = new_state
+        replay_pushed = 0
+        if (
+            replay_enabled
+            and generated_negative_bank is not None
+            and replay_generate_jit is not None
+            and replay_feature_summary_jit is not None
+            and replay_push_per_label > 0
+            and replay_push_interval > 0
+            and (step + 1) >= replay_warmup_steps
+            and ((step + 1) % replay_push_interval == 0)
+        ):
+            replay_labels_host = np.repeat(labels_host, replay_push_per_label)
+            replay_labels = jnp.asarray(replay_labels_host, dtype=jnp.int32)
+            replay_samples = replay_generate_jit(
+                replay_labels,
+                params=state.params,
+                rng=jax.random.fold_in(rng_train, step + 17017),
+            )
+            replay_summaries = replay_feature_summary_jit(replay_samples, feature_params)
+            generated_negative_bank.add(
+                np.asarray(jax.device_get(replay_samples)),
+                replay_labels_host,
+                step=step + 1,
+                summaries=np.asarray(jax.device_get(replay_summaries)),
+            )
+            replay_pushed = replay_labels_host.shape[0]
         total_time = time.time() - start_time
         metrics['total_time'] = total_time
         metrics['process_time'] = process_time
         metrics['kimg'] = (step + 1) * merged_positive.shape[0] / 1000.0
         metrics['forward_kimg'] = (step + 1) * merged_positive.shape[0] / 1000.0 * forward_dict['gen_per_label']
         metrics.update(profile_metrics)
+        metrics.update(replay_metrics)
+        if replay_enabled:
+            metrics['replay/pushed'] = float(replay_pushed)
     
         logger.log_dict(metrics)
-        state = new_state
         step += 1
 
         if step % save_per_step == 0 or step == total_steps: 
@@ -358,7 +714,7 @@ def train_gen(
             )
             mu.sync_global_devices("save checkpoint finished")
 
-        if (step % eval_per_step == 0) or (step == 1) or (step == total_steps):
+        if eval_enabled and ((step % eval_per_step == 0) or (step == 1) or (step == total_steps)):
             is_sanity = (step == 1)  # do a sanity check, to make sure FID env is working
 
             n_samples = 500 if is_sanity else eval_samples
@@ -464,12 +820,15 @@ def main_gen(config, output_dir="runs"):
 def main(args):
     run_init()
     config = load_config(args.config)
+    if getattr(args, "seed", None) is not None:
+        config.train.seed = int(args.seed)
     main_gen(config, output_dir=args.workdir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/gen/latent_ablation.yaml", help="Path to configuration file.")
     parser.add_argument("--workdir", type=str, default="runs", help="Local workdir root for checkpoints/logs.")
+    parser.add_argument("--seed", type=int, default=None, help="Override train.seed from the YAML config.")
     args = parser.parse_args()
     args.output_dir = args.workdir
 

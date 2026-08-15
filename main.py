@@ -5,6 +5,7 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config.")
     parser.add_argument("--gen", action="store_true", help="Run generator training loop. Default runs MAE training.")
     parser.add_argument("--workdir", type=str, default="runs", help="Local workdir root for checkpoints/logs.")
+    parser.add_argument("--seed", type=int, default=None, help="Override train.seed from the YAML config.")
     args = parser.parse_args()
     args.output_dir = args.workdir
 

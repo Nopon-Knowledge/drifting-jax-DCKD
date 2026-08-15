@@ -247,9 +247,13 @@ def _batch_pairwise_distances(U, V):
     return D
 
 
-def compute_precision_recall(features_real, features_fake, k=3):
+def compute_improved_precision_recall(features_real, features_fake, k=3):
     """
-    Compute precision and recall using ADM's manifold estimation approach.
+    Compute the older improved precision/recall manifold metric.
+
+    This is the repository's original ADM-style metric and is intentionally
+    distinct from canonical PRDC.  Paper/evidence outputs should name it
+    ``improved_precision_k3`` / ``improved_recall_k3`` when ``k=3``.
     
     Args:
         features_real: Real image features, shape [N_real, feature_dim]
@@ -281,4 +285,14 @@ def compute_precision_recall(features_real, features_fake, k=3):
         features_real, radii_real, features_fake, radii_fake
     )
     
-    return precision[0], recall[0]  # Return scalar values for k=3
+    return precision[0], recall[0]
+
+
+def compute_precision_recall(features_real, features_fake, k=3):
+    """Backward-compatible alias for :func:`compute_improved_precision_recall`.
+
+    New code should import the explicitly named function so that these values
+    cannot be confused with canonical PRDC precision and recall.
+    """
+
+    return compute_improved_precision_recall(features_real, features_fake, k=k)

@@ -1,4 +1,5 @@
 import functools
+import os
 import pickle
 from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
@@ -52,7 +53,7 @@ class InceptionV3(nn.Module):
 
     def setup(self):
         self.params_dict = None # we migrate this outside
-        self.num_classes_ = 1008
+        self.num_classes_ = int(os.environ.get('INCEPTION_NUM_CLASSES', '1008'))
         # if self.pretrained:
         #     self.params_dict = utils.download(self.ckpt_path, target_md5='ce58f6044b0bf244c4e3185158b7fece')
         #     self.num_classes_ = 1000

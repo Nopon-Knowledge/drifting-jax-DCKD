@@ -3,6 +3,7 @@ from .utils import download
 import pickle
 from functools import partial
 from collections import defaultdict
+import os
 import jax
 from flax import core
 
@@ -100,7 +101,8 @@ def load_all():
     out = core.freeze(out)
 
     n_treeleaves_expected = 472
-    n_params_expected = 23885392
+    n_classes = int(os.environ.get('INCEPTION_NUM_CLASSES', '1008'))
+    n_params_expected = 21820000 + 2049 * n_classes
     n_treeleaves_got = sum(1 for _ in jax.tree_util.tree_leaves(out))
     n_params_got = sum(p.size for p in jax.tree_util.tree_leaves(out))
     assert n_treeleaves_got == n_treeleaves_expected, f'Expected {n_treeleaves_expected} tree leaves, got {n_treeleaves_got}'

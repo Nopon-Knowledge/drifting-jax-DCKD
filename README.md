@@ -1,17 +1,110 @@
-# Generative Modeling via Drifting — JAX Release
+# Density-Calibrated Kernel Drifting (DCKD)
 
 <p align="center">
   <a href="http://arxiv.org/abs/2602.04770"><img src="https://img.shields.io/badge/arXiv-2602.04770-b31b1b.svg" alt="arXiv" /></a>
-  <a href="https://colab.research.google.com/github/lambertae/drifting/blob/main/notebooks/inference_demo.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab" /></a>
+  <a href="https://github.com/Nopon-Knowledge/drifting-jax/actions/workflows/ci.yml"><img src="https://github.com/Nopon-Knowledge/drifting-jax/actions/workflows/ci.yml/badge.svg" alt="Tests" /></a>
+  <a href="https://github.com/lambertae/drifting"><img src="https://img.shields.io/badge/upstream-lambertae%2Fdrifting-555.svg" alt="Upstream repository" /></a>
   <a href="https://huggingface.co/Goodeat/drifting"><img src="https://img.shields.io/badge/HuggingFace-Models-yellow.svg" alt="HuggingFace" /></a>
 </p>
+
+Research code for **Density-Calibrated Kernel Drifting (DCKD)**, an extension
+of [Generative Modeling via Drifting](https://github.com/lambertae/drifting).
+DCKD calibrates the feature-space kernel radius from the current
+`k`-nearest-neighbour geometry during training. It does not add generator
+parameters or alter the one-network-evaluation inference path.
+
+This repository is based on upstream commit
+[`accd0cf`](https://github.com/lambertae/drifting/commit/accd0cf09c33b70892d33941d2a287ca86cb92e1).
+The DCKD study was run on ImageNet-256 with one NVIDIA A800, 30k training
+steps, three training seeds, and one frozen independent 50k-sample evaluation
+stream. The frozen protocol, per-seed aggregate results, tests, and A800
+configurations are included.
+
+> **Result boundary.** DCKD-Global-MS improves the released fixed-kernel
+> baseline on FID for all three observed seeds, but a separately selected
+> tuned fixed-kernel control achieves lower FID on all three seeds. DCKD also
+> trades lower Recall for higher IS, Precision, Density, and Coverage. This
+> release therefore supports kernel-scale calibration as an important design
+> factor; it does not claim that density adaptation is universally superior
+> to a well-tuned fixed bandwidth.
+
+## DCKD Results
+
+All values below use 50,000 generated samples and training seeds 123, 2026,
+and 3407. Values are descriptive mean +/- sample standard deviation.
+
+| Method | FID (lower) | IS (higher) | Precision | Recall | Density | Coverage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Released fixed kernel | 49.570 +/- 1.185 | 41.620 +/- 1.452 | 0.7468 | **0.2058** | 0.9179 | 0.3681 |
+| DCKD-Global-MS | 46.065 +/- 0.789 | **52.505 +/- 0.908** | **0.7710** | 0.1605 | **1.0321** | **0.4088** |
+| Tuned fixed C1 | **45.032 +/- 0.819** | 51.346 +/- 1.447 | 0.7660 | 0.1933 | 0.9936 | 0.4085 |
+
+<p align="center">
+  <img src="results/figures/main_fid.png" width="48%" alt="Per-seed FID comparison" />
+  <img src="results/figures/main_prdc.png" width="48%" alt="PRDC comparison" />
+</p>
+
+The standardized A800 rerun measured 5.563 GPU-hours for the released fixed
+kernel and 7.851 GPU-hours for DCKD-Global-MS (+41.12%). Both use 132.7M
+parameters, one NFE, 49.30 GFLOPs per sample, and approximately 3.41 GiB peak
+inference memory; measured inference latency and throughput remain effectively
+unchanged. See [`results/`](results/) for the aggregate tables and
+[`protocols/pr_dckd_v1.yaml`](protocols/pr_dckd_v1.yaml) for the frozen design.
+
+## DCKD Quick Start
+
+After completing the environment and ImageNet latent-cache setup below, run
+the released fixed baseline and DCKD-Global-MS with matched seeds:
+
+```bash
+JAX_PLATFORMS=gpu,cpu python main.py --gen \
+  --config configs/gen/latent_ablation_a800_hpc.yaml \
+  --workdir runs/baseline_seed123 \
+  --config.train.seed 123
+
+JAX_PLATFORMS=gpu,cpu python main.py --gen \
+  --config configs/gen/latent_ablation_a800_v4_3_dckd_global_radius.yaml \
+  --workdir runs/dckd_global_ms_seed123 \
+  --config.train.seed 123
+```
+
+Evaluate a completed work directory with the same 50k generation stream:
+
+```bash
+JAX_PLATFORMS=gpu,cpu python inference.py \
+  --init-from runs/dckd_global_ms_seed123 \
+  --cfg-scale 2.5 \
+  --seed 271828 \
+  --num-samples 50000 \
+  --eval-batch-size 128 \
+  --json-out results_dckd_seed123.json
+```
+
+Set `IMAGENET_PATH`, `IMAGENET_CACHE_PATH`, `IMAGENET_FID_NPZ`,
+`IMAGENET_PRDC_NPZ`, and `HF_ROOT` through environment variables or
+`utils/env.py`. ImageNet, latent caches, pretrained weights, generated samples,
+and FID/PRDC feature archives are intentionally not redistributed.
+
+## Repository Contents
+
+- `drift_loss.py`: fixed and density-calibrated drifting objectives.
+- `configs/gen/*dckd*.yaml`: local/global and single/multi-scale variants.
+- `inference.py`: manifest-backed FID, IS, and PRDC evaluation.
+- `protocols/pr_dckd_v1.yaml`: frozen experimental design.
+- `results/`: aggregate, non-image-dataset experimental tables and plots.
+- `tests/`: fixed-path equivalence, adaptive-kernel, evaluator, and manifest tests.
+- `scripts/`: A800 launch, reference preparation, evaluation, and efficiency tools.
+
+The remaining sections retain the upstream installation, pretrained-model,
+training, and inference documentation.
 
 <p align="center">
   <img src="assets/teaser_main.png" width="90%" alt="Drifting Models overview" />
 </p>
 
-Official JAX codebase for the ImageNet experiments of *Generative Modeling via Drifting*.
-We provide training, inference, and pretrained weights for one-step image generation on ImageNet 256×256.
+The underlying JAX codebase implements the ImageNet experiments of
+*Generative Modeling via Drifting*. Upstream provides training, inference, and
+pretrained weights for one-step image generation on ImageNet 256x256.
 
 ## Generated Samples
 
@@ -72,7 +165,7 @@ Try the interactive toy demo to see the algorithm in action:
 
 The self-contained Colab notebook lets you generate samples interactively — no local setup required:
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lambertae/drifting/blob/main/notebooks/inference_demo.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Nopon-Knowledge/drifting-jax/blob/main/notebooks/inference_demo.ipynb)
 
 Default notebook configuration:
 
@@ -107,6 +200,27 @@ All artifacts are hosted on HuggingFace at [`Goodeat/drifting`](https://huggingf
 
 ### Install Dependencies
 
+For NVIDIA A800 / CUDA 12:
+
+```bash
+conda create -n drifting-a800 python=3.10 -y
+conda activate drifting-a800
+pip install -r requirements-a800.txt
+export JAX_PLATFORMS=gpu,cpu
+```
+
+Sanity-check that JAX sees the GPUs:
+
+```bash
+python - <<'PY'
+import jax
+print(jax.default_backend())
+print(jax.devices())
+PY
+```
+
+For TPU:
+
 ```bash
 conda create -n drifting-release python=3.10 -y
 conda activate drifting-release
@@ -114,8 +228,8 @@ pip install -r requirements.txt
 export JAX_PLATFORMS=tpu,cpu
 ```
 
-For local TPU runs, keep `JAX_PLATFORMS=tpu,cpu` in the shell before running
-latent-cache building, training, or evaluation. This keeps TPU as the default
+Keep the matching `JAX_PLATFORMS` in the shell before running latent-cache
+building, training, or evaluation. This keeps the accelerator as the default
 backend while still exposing a CPU backend for Flax VAE / checkpoint restore
 paths that expect it.
 
@@ -156,10 +270,13 @@ Only needed for latent-space generators.
 python -m dataset.latent \
   --data-path /path/to/imagenet \
   --target-path /path/to/latent_cache \
+  --backend gpu \
   --local-batch-size 128 \
   --num-workers 8 \
   --pin-memory
 ```
+
+Use `--backend tpu` on TPU, or omit `--backend` to use JAX's default backend.
 
 This encodes ImageNet images through the VAE and writes `.pt` files to `/path/to/latent_cache/{train,val}/`. After building the cache, update `IMAGENET_CACHE_PATH` in `utils/env.py`.
 
@@ -187,7 +304,7 @@ Expected FID numbers match the [Pretrained Models](#pretrained-models) table abo
 
 **Requirements:**
 
-- TPU v4-8 (otherwise reduce `--eval-batch-size` to avoid OOM during VAE decoding)
+- TPU v4-8 or NVIDIA GPU with the CUDA requirements installed. Reduce `--eval-batch-size` if VAE decoding OOMs.
 - ImageNet-256 path configured in `utils/env.py`. Images are generated using the class labels from the ImageNet validation set.
 - Precomputed FID/PR reference stats configured in `utils/env.py`
 
@@ -201,6 +318,13 @@ python main.py --gen --config configs/gen/latent_sota_B.yaml   --workdir runs/ge
 python main.py --gen --config configs/gen/latent_sota_L.yaml   --workdir runs/gen_latent_sota_L
 python main.py --gen --config configs/gen/pixel_sota_B.yaml    --workdir runs/gen_pixel_sota_B
 python main.py --gen --config configs/gen/pixel_sota_L.yaml    --workdir runs/gen_pixel_sota_L
+```
+
+For a conservative A800/CUDA starter run, use the smaller latent ablation
+configuration:
+
+```bash
+python main.py --gen --config configs/gen/latent_ablation_a800.yaml --workdir runs/gen_latent_ablation_a800
 ```
 
 MAE pretrained weights are downloaded automatically from HuggingFace via the `feature.mae_path` config field. No need to train MAE unless experimenting with custom feature extractors.
@@ -269,6 +393,21 @@ python inference.py --init-from /path/to/workdir --cfg-scale 1.0 \
 
 ## Citation
 
+For DCKD, cite this software release while the manuscript is under
+preparation:
+
+```bibtex
+@software{wang2026dckd,
+  title = {Density-Calibrated Kernel Drifting for One-Step Image Generation},
+  author = {Wang, Zixin and Liu, Jingchao and Zhao, Zizheng and Dong, Xiaoyu},
+  year = {2026},
+  version = {1.0.0},
+  url = {https://github.com/Nopon-Knowledge/drifting-jax}
+}
+```
+
+Please also cite the original Drifting Models paper:
+
 ```bibtex
 @article{deng2026generative,
   title={Generative Modeling via Drifting},
@@ -281,3 +420,13 @@ python inference.py --init-from /path/to/workdir --cfg-scale 1.0 \
 ## Acknowledgments
 
 We thank Hanhong Zhao for sanity checking this repository.
+
+## Provenance and License
+
+This is a public research fork of
+[`lambertae/drifting`](https://github.com/lambertae/drifting). The upstream
+repository did not include an explicit license at the pinned commit. As a
+result, making this source visible on GitHub does **not** grant permissions
+beyond those provided by applicable law, the GitHub Terms of Service, or the
+respective copyright holders. See [`NOTICE.md`](NOTICE.md). Contact the
+upstream authors and the DCKD authors before redistribution or commercial use.

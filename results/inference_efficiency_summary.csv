@@ -1,0 +1,3 @@
+method_id,method,n,total_parameters,trainable_parameters,nfe,flops_per_sample,peak_gpu_memory_mib,latency_ms_mean_mean,latency_ms_mean_sample_sd,throughput_samples_per_second_mean,throughput_samples_per_second_sample_sd
+baseline,Fixed kernel,3,132708880,132708880,1,49304870912.0,3488.0,3.68497626700749,0.02042203538899887,677.3567661397507,6.610882774716313
+v4_3,DCKD (Global+Multi),3,132708880,132708880,1,49304870912.0,3488.0,3.6409979484354458,0.03252584387446517,676.1119085887651,4.77853904259832

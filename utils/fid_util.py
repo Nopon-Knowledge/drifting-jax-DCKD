@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import time
-from typing import Dict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -14,7 +19,7 @@ import jax.experimental.multihost_utils as mu
 from utils.logging import log_for_0
 from dataset.dataset import epoch0_sampler
 from utils.hsdp_util import pad_and_merge, ddp_shard
-from utils.env import IMAGENET_FID_NPZ, IMAGENET_PR_NPZ
+from utils.env import IMAGENET_FID_NPZ, IMAGENET_PR_NPZ, IMAGENET_PRDC_NPZ
 
 
 INCEPTION_NET = None
@@ -22,6 +27,7 @@ _DATASET_STATS = {
     "imagenet256": IMAGENET_FID_NPZ,
 }
 _PR_REF_PATH = IMAGENET_PR_NPZ
+_PRDC_REF_PATH = IMAGENET_PRDC_NPZ
 
 
 def _canonical_dataset_name(name: str) -> str:
@@ -165,6 +171,205 @@ def _compute_inception_score(logits, splits=10):
     return float(np.mean(scores)), float(np.std(scores))
 
 
+def _sha256_file(path: str | os.PathLike[str], chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_array(array: np.ndarray) -> str:
+    array = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("utf-8"))
+    digest.update(json.dumps(list(array.shape)).encode("utf-8"))
+    digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
+
+
+def save_inception_artifacts(
+    output_path: str | os.PathLike[str],
+    *,
+    features: np.ndarray,
+    logits: np.ndarray | None = None,
+    labels: np.ndarray | None = None,
+    relative_paths: np.ndarray | list[str] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Atomically save auditable Inception features and optional companions.
+
+    The uncompressed NPZ contains a JSON manifest plus the requested arrays.
+    A ``.manifest.json`` sidecar additionally records the final archive's
+    SHA-256 and byte size.  Uncompressed storage avoids the substantial CPU and
+    temporary-memory cost of compressing 50k x 2048 reference features.
+    """
+
+    output = Path(output_path).expanduser().resolve()
+    features = np.asarray(features)
+    if features.ndim != 2 or features.shape[0] == 0:
+        raise ValueError(f"features must have shape [N, D], got {features.shape}.")
+    if not np.issubdtype(features.dtype, np.floating):
+        raise TypeError(f"features must be floating point, got {features.dtype}.")
+    if not np.isfinite(features).all():
+        raise ValueError("features contain NaN or infinite values.")
+
+    arrays: Dict[str, np.ndarray] = {
+        "features": np.ascontiguousarray(features),
+    }
+    for name, value in (("logits", logits), ("labels", labels)):
+        if value is None:
+            continue
+        value = np.asarray(value)
+        if value.shape[0] != features.shape[0]:
+            raise ValueError(
+                f"{name} first dimension must equal features ({features.shape[0]}), "
+                f"got {value.shape}."
+            )
+        arrays[name] = np.ascontiguousarray(value)
+
+    if relative_paths is not None:
+        paths = np.asarray(relative_paths, dtype=np.str_)
+        if paths.ndim != 1 or paths.shape[0] != features.shape[0]:
+            raise ValueError(
+                "relative_paths must have one entry per feature, got "
+                f"{paths.shape} for {features.shape[0]} features."
+            )
+        arrays["relative_paths"] = np.ascontiguousarray(paths)
+
+    manifest: Dict[str, Any] = {
+        "schema_version": "drifting-inception-artifacts-v1",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "arrays": {
+            name: {
+                "shape": list(array.shape),
+                "dtype": str(array.dtype),
+                "sha256": _sha256_array(array),
+            }
+            for name, array in arrays.items()
+        },
+        "metadata": dict(metadata or {}),
+    }
+    arrays["manifest_json"] = np.asarray(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+    )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output = output.with_name(f".{output.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp_output, "wb") as handle:
+            np.savez(handle, **arrays)
+        os.replace(tmp_output, output)
+    finally:
+        if tmp_output.exists():
+            tmp_output.unlink()
+
+    manifest["archive"] = {
+        "path": str(output),
+        "bytes": output.stat().st_size,
+        "sha256": _sha256_file(output),
+    }
+    manifest_path = output.with_suffix(output.suffix + ".manifest.json")
+    tmp_manifest = manifest_path.with_name(
+        f".{manifest_path.name}.tmp.{os.getpid()}"
+    )
+    try:
+        tmp_manifest.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp_manifest, manifest_path)
+    finally:
+        if tmp_manifest.exists():
+            tmp_manifest.unlink()
+    return manifest
+
+
+def load_inception_feature_reference(
+    reference_path: str | os.PathLike[str] = _PRDC_REF_PATH,
+) -> Dict[str, np.ndarray]:
+    """Load a feature-level reference produced by the preparation script."""
+
+    path = Path(reference_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Inception feature reference not found: {path}. "
+            "Run scripts/prepare_imagenet_fid_stats.py first."
+        )
+    with np.load(path, allow_pickle=False) as data:
+        if "features" not in data:
+            raise ValueError(
+                f"{path} is not a feature-level reference (missing 'features'). "
+                "Legacy image archives cannot be used for canonical PRDC."
+            )
+        result = {"features": np.asarray(data["features"])}
+        for name in ("labels", "relative_paths", "logits", "manifest_json"):
+            if name in data:
+                result[name] = np.asarray(data[name])
+    if result["features"].ndim != 2:
+        raise ValueError(
+            f"Reference features must have shape [N, D], got {result['features'].shape}."
+        )
+    return result
+
+
+def _load_improved_pr_reference_features(
+    reference_path: str | os.PathLike[str] | None = None,
+) -> np.ndarray:
+    """Load features for the legacy improved-P/R metric.
+
+    A new feature-level reference is preferred.  The old ``arr_0`` image
+    archive remains supported so existing workflows are not silently broken.
+    """
+
+    if reference_path is None:
+        reference_path = _PRDC_REF_PATH if Path(_PRDC_REF_PATH).is_file() else _PR_REF_PATH
+    path = Path(reference_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Improved-P/R reference not found: {path}.")
+    with np.load(path, allow_pickle=False) as data:
+        if "features" in data:
+            return np.asarray(data["features"])
+        if "arr_0" not in data:
+            raise ValueError(
+                f"Unsupported improved-P/R reference format in {path}; "
+                "expected 'features' or legacy 'arr_0'."
+            )
+        ref_images = np.asarray(data["arr_0"], dtype=np.uint8)
+    return _compute_stats(
+        ref_images,
+        ref_images.shape[0],
+        compute_logits=False,
+        compute_features=True,
+    )["features"]
+
+
+def _gather_valid_labels(
+    labels: np.ndarray,
+    masks: np.ndarray,
+    num_samples: int,
+) -> np.ndarray:
+    """Mirror feature gathering/filtering for numeric generated labels."""
+
+    labels = np.asarray(labels)
+    masks = np.asarray(masks)
+    if labels.shape[0] != masks.shape[0]:
+        raise ValueError(
+            f"sample_labels and masks must have equal length, got "
+            f"{labels.shape[0]} and {masks.shape[0]}."
+        )
+    if not np.issubdtype(labels.dtype, np.number):
+        raise TypeError(f"sample_labels must be numeric, got {labels.dtype}.")
+    all_labels = multihost_utils.process_allgather(jnp.asarray(labels))
+    all_labels = np.asarray(jax.device_get(all_labels)).reshape(
+        (-1, *labels.shape[1:])
+    )
+    all_masks = multihost_utils.process_allgather(jnp.asarray(masks))
+    all_masks = np.asarray(jax.device_get(all_masks)).reshape(-1)
+    valid_len = min(all_labels.shape[0], all_masks.shape[0])
+    return all_labels[:valid_len][all_masks[:valid_len] > 0.5][:num_samples]
+
+
 def _load_ref_stats(dataset_name: str):
     canon = _canonical_dataset_name(dataset_name)
     path = _DATASET_STATS[canon]
@@ -184,6 +389,15 @@ def evaluate_fid(
     log_folder="fid",
     log_prefix="gen_model",
     eval_prc_recall=False,
+    eval_prdc=False,
+    prdc_nearest_k=5,
+    prdc_reference_path=None,
+    improved_pr_reference_path=None,
+    feature_artifact_path=None,
+    sample_labels=None,
+    artifact_metadata=None,
+    prdc_row_batch_size=1024,
+    prdc_col_batch_size=1024,
     eval_isc=True,
     eval_fid=True,
     rng_eval=None,
@@ -206,7 +420,9 @@ def evaluate_fid(
             removed across all hosts.
         log_folder: Top-level metric namespace written into the logger.
         log_prefix: Per-run metric prefix inside ``log_folder``.
-        eval_prc_recall: Whether to compute precision/recall in addition to FID.
+        eval_prc_recall: Whether to compute the legacy improved P/R at k=3.
+        eval_prdc: Whether to compute canonical P/R/D/C.
+        prdc_nearest_k: Neighborhood size for canonical PRDC (default 5).
         eval_isc: Whether to compute Inception Score.
         eval_fid: Whether to compute FID.
         rng_eval: Base PRNGKey for deterministic evaluation sampling.
@@ -216,17 +432,63 @@ def evaluate_fid(
         ``fid``, ``isc_mean``, ``isc_std``, ``precision``, ``recall``, and
         ``fid_time`` depending on which evaluations are enabled.
     """
-    from .jax_fid.fid import compute_frechet_distance
-    from .jax_fid.precision_recall import compute_precision_recall
+    samples, masks, generation_time = generate_samples(
+        gen_func=gen_func,
+        gen_params=gen_params,
+        eval_loader=eval_loader,
+        num_samples=num_samples,
+        rng_eval=rng_eval,
+    )
+    return evaluate_generated_samples(
+        dataset_name=dataset_name,
+        samples=samples,
+        masks=masks,
+        logger=logger,
+        num_samples=num_samples,
+        log_folder=log_folder,
+        log_prefix=log_prefix,
+        eval_prc_recall=eval_prc_recall,
+        eval_prdc=eval_prdc,
+        prdc_nearest_k=prdc_nearest_k,
+        prdc_reference_path=prdc_reference_path,
+        improved_pr_reference_path=improved_pr_reference_path,
+        feature_artifact_path=feature_artifact_path,
+        sample_labels=sample_labels,
+        artifact_metadata=artifact_metadata,
+        prdc_row_batch_size=prdc_row_batch_size,
+        prdc_col_batch_size=prdc_col_batch_size,
+        eval_isc=eval_isc,
+        eval_fid=eval_fid,
+        generation_time=generation_time,
+    )
 
+
+def generate_samples(
+    *,
+    gen_func,
+    gen_params,
+    eval_loader,
+    num_samples,
+    rng_eval=None,
+    return_metadata=False,
+):
+    """Generate local uint8 samples and validity masks without running Inception.
+
+    When ``return_metadata`` is true, the fourth return value contains arrays
+    aligned one-for-one with the saved sample rows.  They make the conditional
+    label schedule and the ``fold_in(base_key, batch_index)`` RNG stream
+    auditable without changing the generator call itself.
+    """
     if rng_eval is None:
         rng_eval = jax.random.PRNGKey(0)
 
     start = time.time()
-
     eval_iter = epoch0_sampler(eval_loader)
     all_samples = []
     all_masks = []
+    all_labels = []
+    all_rng_batch_indices = []
+    all_rng_positions = []
     cur = 0
     goal_bsz = None
     for i, batch in enumerate(eval_iter):
@@ -238,16 +500,86 @@ def evaluate_fid(
         gen_samples = gen_func(batch, **gen_params, rng=rng_step)
         gen_samples = jax.device_put(gen_samples, ddp_shard())
         mask = jax.device_put(mask, ddp_shard())
-        all_samples.append(_to_uint8(_to_local_cpu(gen_samples)))
-        all_masks.append(_to_local_cpu(mask))
+        local_samples = _to_uint8(_to_local_cpu(gen_samples))
+        local_masks = _to_local_cpu(mask)
+        local_labels = _to_local_cpu(batch[1])
+        local_count = int(local_samples.shape[0])
+        if not (
+            local_masks.shape[0] == local_labels.shape[0] == local_count
+        ):
+            raise RuntimeError(
+                "Generated sample provenance arrays are misaligned: "
+                f"samples={local_count}, masks={local_masks.shape[0]}, "
+                f"labels={local_labels.shape[0]}."
+            )
+        all_samples.append(local_samples)
+        all_masks.append(local_masks)
+        all_labels.append(np.asarray(local_labels, dtype=np.int64))
+        all_rng_batch_indices.append(
+            np.full(local_count, i, dtype=np.int64)
+        )
+        all_rng_positions.append(
+            np.arange(local_count, dtype=np.int64)
+        )
         cur += gen_samples.shape[0]
+        if i == 0 or (i + 1) % 100 == 0 or cur >= num_samples:
+            log_for_0("FID generation: %d/%d local samples", min(cur, num_samples), num_samples)
         if cur >= num_samples:
             break
 
     samples = np.concatenate(all_samples, axis=0)
     masks = np.concatenate(all_masks, axis=0)
+    generation_time = float(time.time() - start)
+    if not return_metadata:
+        return samples, masks, generation_time
+    metadata = {
+        "labels": np.concatenate(all_labels, axis=0),
+        "rng_batch_indices": np.concatenate(all_rng_batch_indices, axis=0),
+        "rng_positions": np.concatenate(all_rng_positions, axis=0),
+        "process_index": int(jax.process_index()),
+        "process_count": int(jax.process_count()),
+        "rng_scheme": "jax.random.fold_in(PRNGKey(generation_seed), batch_index)",
+    }
+    return samples, masks, generation_time, metadata
 
-    stats = _compute_stats(samples, num_samples, compute_logits=eval_isc, compute_features=eval_prc_recall, masks=masks)
+
+def evaluate_generated_samples(
+    *,
+    dataset_name,
+    samples,
+    masks,
+    logger,
+    num_samples,
+    log_folder="fid",
+    log_prefix="gen_model",
+    eval_prc_recall=False,
+    eval_prdc=False,
+    prdc_nearest_k=5,
+    prdc_reference_path=None,
+    improved_pr_reference_path=None,
+    feature_artifact_path=None,
+    sample_labels=None,
+    artifact_metadata=None,
+    prdc_row_batch_size=1024,
+    prdc_col_batch_size=1024,
+    eval_isc=True,
+    eval_fid=True,
+    generation_time=0.0,
+):
+    """Compute FID/IS and optional improved-P/R or canonical PRDC metrics."""
+    from .jax_fid.fid import compute_frechet_distance
+    from .jax_fid.prdc import compute_prdc
+    from .jax_fid.precision_recall import compute_improved_precision_recall
+
+    start = time.time()
+    save_artifacts = bool(feature_artifact_path)
+    stats = _compute_stats(
+        samples,
+        num_samples,
+        compute_logits=(eval_isc or save_artifacts),
+        compute_features=(eval_prc_recall or eval_prdc or save_artifacts),
+        masks=masks,
+    )
     ref = _load_ref_stats(dataset_name)
 
     metrics: Dict[str, float] = {}
@@ -258,13 +590,49 @@ def evaluate_fid(
         metrics["isc_mean"] = mean
         metrics["isc_std"] = std
     if eval_prc_recall and "features" in stats:
-        ref_images = np.load(_PR_REF_PATH)["arr_0"].astype(np.uint8)
-        ref_stats = _compute_stats(ref_images, 10000, compute_logits=False, compute_features=True)
-        precision, recall = compute_precision_recall(ref_stats["features"], stats["features"], k=3)
-        metrics["precision"] = float(precision)
-        metrics["recall"] = float(recall)
+        ref_features = _load_improved_pr_reference_features(
+            improved_pr_reference_path
+        )
+        precision, recall = compute_improved_precision_recall(
+            ref_features, stats["features"], k=3
+        )
+        metrics["improved_precision_k3"] = float(precision)
+        metrics["improved_recall_k3"] = float(recall)
+    if eval_prdc and "features" in stats:
+        reference = load_inception_feature_reference(
+            prdc_reference_path or _PRDC_REF_PATH
+        )
+        prdc = compute_prdc(
+            reference["features"],
+            stats["features"],
+            nearest_k=prdc_nearest_k,
+            row_batch_size=prdc_row_batch_size,
+            col_batch_size=prdc_col_batch_size,
+        )
+        metrics.update(
+            {
+                "prdc_precision": prdc["precision"],
+                "prdc_recall": prdc["recall"],
+                "prdc_density": prdc["density"],
+                "prdc_coverage": prdc["coverage"],
+                "prdc_nearest_k": prdc["nearest_k"],
+            }
+        )
+    if save_artifacts:
+        artifact_labels = None
+        if sample_labels is not None:
+            artifact_labels = _gather_valid_labels(
+                sample_labels, masks, num_samples
+            )
+        save_inception_artifacts(
+            feature_artifact_path,
+            features=stats["features"],
+            logits=stats.get("logits"),
+            labels=artifact_labels,
+            metadata=artifact_metadata,
+        )
 
-    metrics["fid_time"] = float(time.time() - start)
+    metrics["fid_time"] = float(generation_time + time.time() - start)
     logger.log_dict({f"{log_folder}/{log_prefix}_{k}": v for k, v in metrics.items()})
     logger.log_image(f"{log_folder}/{log_prefix}_viz", samples[:64])
     mu.sync_global_devices("fid evaluation finished")
