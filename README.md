@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="http://arxiv.org/abs/2602.04770"><img src="https://img.shields.io/badge/arXiv-2602.04770-b31b1b.svg" alt="arXiv" /></a>
-  <a href="https://github.com/Nopon-Knowledge/drifting-jax/actions/workflows/ci.yml"><img src="https://github.com/Nopon-Knowledge/drifting-jax/actions/workflows/ci.yml/badge.svg" alt="Tests" /></a>
+  <a href="https://github.com/Nopon-Knowledge/drifting-jax-DCKD/actions/workflows/ci.yml"><img src="https://github.com/Nopon-Knowledge/drifting-jax-DCKD/actions/workflows/ci.yml/badge.svg" alt="Tests" /></a>
   <a href="https://github.com/lambertae/drifting"><img src="https://img.shields.io/badge/upstream-lambertae%2Fdrifting-555.svg" alt="Upstream repository" /></a>
   <a href="https://huggingface.co/Goodeat/drifting"><img src="https://img.shields.io/badge/HuggingFace-Models-yellow.svg" alt="HuggingFace" /></a>
 </p>
@@ -165,7 +165,7 @@ Try the interactive toy demo to see the algorithm in action:
 
 The self-contained Colab notebook lets you generate samples interactively — no local setup required:
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Nopon-Knowledge/drifting-jax/blob/main/notebooks/inference_demo.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Nopon-Knowledge/drifting-jax-DCKD/blob/main/notebooks/inference_demo.ipynb)
 
 Default notebook configuration:
 
@@ -402,7 +402,7 @@ preparation:
   author = {Wang, Zixin and Liu, Jingchao and Zhao, Zizheng and Dong, Xiaoyu},
   year = {2026},
   version = {1.0.0},
-  url = {https://github.com/Nopon-Knowledge/drifting-jax}
+  url = {https://github.com/Nopon-Knowledge/drifting-jax-DCKD}
 }
 ```
 
