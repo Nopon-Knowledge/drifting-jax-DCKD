@@ -6,8 +6,8 @@ title: Density-Calibrated Kernel Drifting for One-Step Image Generation
 type: software
 version: 1.0.0
 date-released: 2026-08-15
-url: https://github.com/Nopon-Knowledge/drifting-jax
-repository-code: https://github.com/Nopon-Knowledge/drifting-jax
+url: https://github.com/Nopon-Knowledge/drifting-jax-DCKD
+repository-code: https://github.com/Nopon-Knowledge/drifting-jax-DCKD
 authors:
   - family-names: Wang
     given-names: Zixin
